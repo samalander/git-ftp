@@ -31,6 +31,8 @@ DRY_RUN=0
 FORCE=0
 ACTION=""
 ENABLE_REMOTE_LCK=0
+ERROR_COUNT=0
+ERROR_PERCENT=5
 
 VERSION='0.0.9'
 AUTHORS='René Moser <mail@renemoser.net>'
@@ -83,6 +85,7 @@ OPTIONS
 	-a, --all		Uploads all files, ignores deployed SHA1 hash
 	-l, --lock		Enable/Disable remote locking
 	-f, --force		Force, does not ask questions
+	-r, --retry		Maximum total transfer retries (% of total, 5 default)
 	-v, --verbose	Verbose
 	--version		Prints version
 
@@ -151,23 +154,42 @@ write_info() {
 	fi
 }
 
+# Handler for transfer errors
+handle_transfer_error() {
+	ERROR_COUNT=$((ERROR_COUNT+1))
+	if [ $ERROR_COUNT -ge $ERROR_MAX ]; then
+		write_error_and_die "Encountered more than the $ERROR_MAX maximum transfer errors permitted"
+	else
+		write_log "Encountered transfer error $ERROR_COUNT"
+	fi
+}
+
 upload_file() {
 	SRC_FILE="$1"
 	DEST_FILE="$2"
 	if [ -z $DEST_FILE ]; then
 		DEST_FILE=$SRC_FILE
 	fi
-	curl -s -T $SRC_FILE --user $REMOTE_USER:$REMOTE_PASSWD --ftp-create-dirs -# $REMOTE_PROTOCOL://$REMOTE_HOST/${REMOTE_PATH}${DEST_FILE}
+	until curl -s -T $SRC_FILE --user $REMOTE_USER:$REMOTE_PASSWD --ftp-create-dirs $REMOTE_PROTOCOL://$REMOTE_HOST/${REMOTE_PATH}${DEST_FILE}; do
+		handle_transfer_error
+	done
+
 }
 
 remove_file() {
 	FILENAME=$1
-	curl -s --user $REMOTE_USER:$REMOTE_PASSWD -Q "-DELE ${REMOTE_PATH}${FILENAME}" $REMOTE_PROTOCOL://$REMOTE_HOST > /dev/null 2>&1
+	until curl -s --user $REMOTE_USER:$REMOTE_PASSWD -Q "-DELE ${REMOTE_PATH}${FILENAME}" $REMOTE_PROTOCOL://$REMOTE_HOST > /dev/null 2>&1; do
+		handle_transfer_error
+	done
+
 }
 
 get_file_content() {
 	SRC_FILE="$1"
-	curl -s --user $REMOTE_USER:$REMOTE_PASSWD $REMOTE_PROTOCOL://$REMOTE_HOST/${REMOTE_PATH}${SRC_FILE}
+	until curl -s --user $REMOTE_USER:$REMOTE_PASSWD $REMOTE_PROTOCOL://$REMOTE_HOST/${REMOTE_PATH}${SRC_FILE}; do
+		handle_transfer_error
+	done
+
 }
 
 upload_local_sha1() {
@@ -332,6 +354,27 @@ do
 			DRY_RUN=1
 			write_log "Running dry, won't do anything"
 			;;
+		-r|--retry*)
+			case "$#,$1" in
+			    *,*=*)
+			        ERROR_PERCENT=`expr "z$1" : 'z-[^=]*=\([[:digit:]]*\)'`
+			        if [ -z $ERROR_PERCENT ]; then
+			            usage
+			        fi
+			        ;;
+			    1,*)
+			        usage
+			        ;;
+			    *)
+			        if [ `echo "$2" | egrep '^[[:digit:]]+$' | wc -l` -eq 1 ]; then
+				        ERROR_PERCENT="$2"
+				        shift
+				    else
+				        usage
+			        fi
+			        ;;
+			esac
+			;;
 		-v|--verbose)
 			VERBOSE=1
 			;;
@@ -472,6 +515,7 @@ fi
 DONE_ITEMS=0
 TOTAL_ITEMS=`echo "$FILES_CHANGED" | wc -l`
 TOTAL_ITEMS=$((TOTAL_ITEMS+0)) # trims whitespaces produced by wc
+ERROR_MAX=$((TOTAL_ITEMS*ERROR_PERCENT/100))
 write_log "There are $TOTAL_ITEMS changed files"
 
 # Uploack remote lock file if enabled
